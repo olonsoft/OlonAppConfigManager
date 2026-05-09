@@ -1,0 +1,37 @@
+---
+BasedOnStyle: Google
+AccessModifierOffset: -2
+AlignArrayOfStructures: Left
+AlignConsecutiveAssignments:
+  Enabled: true
+  PadOperators: true
+AlignConsecutiveDeclarations: true
+AlignConsecutiveMacros:
+  Enabled: true
+  PadOperators: true
+AlignConsecutiveShortCaseStatements:
+  Enabled: true
+AlignEscapedNewlines: Left
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AlignTrailingComments:
+  Kind: Leave
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLambdasOnASingleLine: Empty
+AllowShortLoopsOnASingleLine: false
+BinPackArguments: false
+ColumnLimit: 120
+ContinuationIndentWidth: 4
+Cpp11BracedListStyle: false
+IndentCaseLabels: true
+IndentPPDirectives: BeforeHash
+IndentWidth: 4
+LambdaBodyIndentation: OuterScope
+NamespaceIndentation: None
+ReflowComments: Never
+SpacesBeforeTrailingComments: 2
+TabWidth: 4
