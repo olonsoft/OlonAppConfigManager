@@ -75,18 +75,6 @@ struct AppConfig {
     char webPortalPassword[33] = "admin";
 };
 
-// ----  Event payloads  ---------------------------------------
-
-struct RetryPayload {
-    uint8_t retryCount;   // Current attempt number (1-based)
-    uint8_t maxRetries;
-};
-
-struct RssiPayload {
-    int8_t rssi;
-    int8_t threshold;
-};
-
 // ============================================================
 //  WiFi state machine states
 // ============================================================
@@ -138,6 +126,23 @@ enum class AppWiFiState : uint8_t {
 
     // ---- Fatal ----
     STATE_ERROR                     // Unrecoverable (init failure, etc.)
+};
+
+// ----  Event payloads  ---------------------------------------
+
+struct RetryPayload {
+    uint8_t retryCount;   // Current attempt number (1-based)
+    uint8_t maxRetries;
+};
+
+struct RssiPayload {
+    int8_t rssi;
+    int8_t threshold;
+};
+
+struct StateChangePayload {
+    AppWiFiState prevState;
+    AppWiFiState nextState;
 };
 
 // ============================================================
@@ -287,7 +292,7 @@ class AppConfigManager {
     void handleState_NetworkDisabled();
     void handleState_Error();
 
-    void transitionTo(AppWiFiState next);
+    void transitionTo(AppWiFiState nextState);
 
     // ----------------------------------------------------------
     //  Web server helpers

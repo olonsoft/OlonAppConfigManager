@@ -81,6 +81,12 @@ void setup() {
     wifiManager.setRssiThreshold(-80, 30);  // dBm, check every 30 s
 
     // 3. Subscribe to events
+    
+    eventBus.subscribe(EventType::APP_WIFI_STATE_CHANGE, [](EventType, const void* p) {
+        auto* r = static_cast<const StateChangePayload*>(p);
+        Serial.printf("State change : %s → %s\n", wifiManager.getStateString(r->prevState).c_str(), wifiManager.getStateString(r->nextState).c_str());
+    });
+    
     eventBus.subscribe(EventType::APP_WIFI_CONNECTED, [](EventType, const void*) {
         Serial.println("WiFi connected");
     });
@@ -323,21 +329,22 @@ Returns a const reference to the in-memory config snapshot. Do not cache the ref
 
 Subscribe via `eventBus.subscribe(EventType::..., callback)`. All events are published from inside `loop()` (i.e. from the main thread — no concurrency concerns).
 
-| Event                         | Payload         | Meaning                                               |
-| ----------------------------- | --------------- | ----------------------------------------------------- |
-| `APP_WIFI_CONNECTING`         | `nullptr`       | A connection attempt has started                      |
-| `APP_WIFI_GOT_IP`             | `nullptr`       | IP address assigned by DHCP or static config          |
-| `APP_WIFI_CONNECTED`          | `nullptr`       | Connection stable; mDNS started                       |
-| `APP_WIFI_DISCONNECTED`       | `nullptr`       | Connection lost, or `disconnect()` confirmed          |
-| `APP_WIFI_AUTH_FAILED`        | `nullptr`       | Wrong WiFi password; this profile will not be retried |
-| `APP_WIFI_RETRY`              | `RetryPayload*` | Retry attempt in progress                             |
-| `APP_WIFI_PORTAL_STARTED`     | `nullptr`       | Captive portal (AP mode) is now active                |
-| `APP_WIFI_PORTAL_TIMEOUT`     | `nullptr`       | Captive portal timed out                              |
-| `APP_WIFI_PORTAL_STOPPED`     | `nullptr`       | Captive portal torn down and memory freed             |
-| `APP_WIFI_WEB_PORTAL_STARTED` | `nullptr`       | Web portal (STA mode) is now active                   |
-| `APP_WIFI_WEB_PORTAL_STOPPED` | `nullptr`       | Web portal torn down and memory freed                 |
-| `APP_WIFI_CONFIG_SAVED`       | `nullptr`       | New config written; call `getConfig()` to read it     |
-| `APP_WIFI_RSSI_LOW`           | `RssiPayload*`  | RSSI dropped below configured threshold               |
+|             Event             |        Payload        |                        Meaning                        |
+| ----------------------------- | --------------------- | ----------------------------------------------------- |
+| `APP_WIFI_STATE_CHANGE`       | `StateChangePayload*` | Event of state change                                 |
+| `APP_WIFI_CONNECTING`         | `nullptr`             | A connection attempt has started                      |
+| `APP_WIFI_GOT_IP`             | `nullptr`             | IP address assigned by DHCP or static config          |
+| `APP_WIFI_CONNECTED`          | `nullptr`             | Connection stable; mDNS started                       |
+| `APP_WIFI_DISCONNECTED`       | `nullptr`             | Connection lost, or `disconnect()` confirmed          |
+| `APP_WIFI_AUTH_FAILED`        | `nullptr`             | Wrong WiFi password; this profile will not be retried |
+| `APP_WIFI_RETRY`              | `RetryPayload*`       | Retry attempt in progress                             |
+| `APP_WIFI_PORTAL_STARTED`     | `nullptr`             | Captive portal (AP mode) is now active                |
+| `APP_WIFI_PORTAL_TIMEOUT`     | `nullptr`             | Captive portal timed out                              |
+| `APP_WIFI_PORTAL_STOPPED`     | `nullptr`             | Captive portal torn down and memory freed             |
+| `APP_WIFI_WEB_PORTAL_STARTED` | `nullptr`             | Web portal (STA mode) is now active                   |
+| `APP_WIFI_WEB_PORTAL_STOPPED` | `nullptr`             | Web portal torn down and memory freed                 |
+| `APP_WIFI_CONFIG_SAVED`       | `nullptr`             | New config written; call `getConfig()` to read it     |
+| `APP_WIFI_RSSI_LOW`           | `RssiPayload*`        | RSSI dropped below configured threshold               |
 
 ### Event Payload Structs
 
@@ -351,6 +358,12 @@ struct RssiPayload {
     int8_t rssi;       // Current RSSI in dBm
     int8_t threshold;  // Configured threshold in dBm
 };
+
+struct StateChangePayload {
+    AppWiFiState prevState;
+    AppWiFiState nextState;
+};
+
 ```
 
 Payload pointers are only valid for the duration of the callback. Do not store them.
@@ -361,7 +374,7 @@ Payload pointers are only valid for the duration of the callback. Do not store t
 
 The manager is driven entirely by a non-blocking state machine. Every `loop()` call executes exactly one state handler. Transitions are instantaneous (no blocking waits anywhere — delays are implemented as timestamp comparisons).
 
-### State Reference
+### State Reference `AppWiFiState`
 
 | State                           | Description                                                                    |
 | ------------------------------- | ------------------------------------------------------------------------------ |

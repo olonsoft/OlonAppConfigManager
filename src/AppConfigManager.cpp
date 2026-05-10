@@ -11,36 +11,11 @@
 
 #include "EventBus.h"
 
-#ifdef OLON_DEBUG
-    #define LOG_IMPL(color, level, tag, format, ...)                                           \
-        do {                                                                                   \
-            Serial.printf_P(PSTR("\033[" color "m%10lu [" level "] [%s] " format "\033[0m\n"), \
-                            millis(),                                                          \
-                            tag,                                                               \
-                            ##__VA_ARGS__);                                                    \
-        } while (0)
-
-    #define LOGD(tag, format, ...) LOG_IMPL("0;36", "D", tag, format, ##__VA_ARGS__)
-    #define LOGI(tag, format, ...) LOG_IMPL("0;32", "I", tag, format, ##__VA_ARGS__)
-    #define LOGW(tag, format, ...) LOG_IMPL("0;33", "W", tag, format, ##__VA_ARGS__)
-    #define LOGE(tag, format, ...) LOG_IMPL("0;31", "E", tag, format, ##__VA_ARGS__)
-    #define LOGRAW(format, ...)                           \
-        do {                                              \
-            Serial.printf_P(PSTR(format), ##__VA_ARGS__); \
-        } while (0)
-#else
-    #define LOGD(tag, format, ...) ((void)0)
-    #define LOGI(tag, format, ...) ((void)0)
-    #define LOGW(tag, format, ...) ((void)0)
-    #define LOGE(tag, format, ...) ((void)0)
-    #define LOGRAW(...)            ((void)0)
-#endif
-
 // ============================================================
 //  PROGMEM HTML — split into head, body chunks, closing
 //  Keep each chunk under 4 KB for safe send_P on ESP8266.
 // ============================================================
-// (Defined in AppConfigManager_HTML.h, included below)
+// (Defined in AppConfigManager_HTML.h)
 #include "AppConfigManager_HTML.h"
 
 // ============================================================
@@ -283,11 +258,11 @@ String AppConfigManager::getStateString(AppWiFiState state) const {
 //  State machine — transition helper
 // ============================================================
 
-void AppConfigManager::transitionTo(AppWiFiState next) {
+void AppConfigManager::transitionTo(AppWiFiState nextState) {
     _prevState = _state;
-    if (_prevState != next)
-        LOGD(TAG, "Transitioning from %s to %s", getStateString(_prevState).c_str(), getStateString(next).c_str());
-    _state = next;
+    StateChangePayload payload { _prevState, nextState };
+    _eventBus.publish(EventType::APP_WIFI_STATE_CHANGE, &payload);
+    _state = nextState;
 }
 
 // ============================================================
@@ -834,7 +809,7 @@ void AppConfigManager::promoteSecondaryToPrimary() {
 // ============================================================
 
 void AppConfigManager::checkRssi() {
-    unsigned long intervalMs = (unsigned long)_rssiCheckIntervalSec * 1000UL;
+    uint32_t intervalMs = (uint32_t)_rssiCheckIntervalSec * 1000UL;
     if (millis() - _lastRssiCheckMs < intervalMs) return;
 
     _lastRssiCheckMs = millis();
@@ -1061,27 +1036,28 @@ void AppConfigManager::send204(AsyncWebServerRequest* request) {
 }
 
 void AppConfigManager::setupCaptivePortalHandlers() {
+    for (uint8_t i = 0; CAPTIVE_PATHS[i] != nullptr; i++) {
+        _webServer->on(CAPTIVE_PATHS[i], HTTP_GET, [this](AsyncWebServerRequest* req) {
+            redirectToPortal(req);
+        });
+    }
 
-  // rest of the captive portal endpoints, not handled by redirect to root
-  // Windows
+    // rest of the captive portal endpoints, not handled by redirect to root
+    // Windows
     _webServer->on("/connecttest.txt", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        LOGD(TAG, "connecttest.txt");
         request->redirect("http://logout.net");
     });
 
     _webServer->on("/nm", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        LOGD(TAG, "nm");
         request->send(204, "text/plain", "");
     });
 
-  // Others
+    // Others
     _webServer->on("/wpad.dat", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        LOGD(TAG, "wpad.dat");
         request->send(404);
     });
 
     _webServer->on("/success.txt", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        LOGD(TAG, "success.txt");
         request->send(200);
     });
 }
@@ -1091,35 +1067,24 @@ void AppConfigManager::setupCaptivePortalHandlers() {
 // ============================================================
 
 void AppConfigManager::registerRoutes() {
-    for (uint8_t i = 0; CAPTIVE_PATHS[i] != nullptr; i++) {
-        _webServer->on(CAPTIVE_PATHS[i], HTTP_GET, [this](AsyncWebServerRequest* req) {
-            LOGD(TAG, "URL: %s", req->url().c_str());
-            redirectToPortal(req);
-        });
-    }
-
     setupCaptivePortalHandlers();
 
     _webServer->on("/favicon.ico", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        LOGD(TAG, "favicon");
         req->send(204, "text/plain", "");
     });
 
     // ---- Config page ----
     _webServer->on("/", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        LOGD(TAG, "Root");
         onGetRoot(req);
     });
 
     // ---- Scan ----
     _webServer->on("/scan", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        LOGD(TAG, "Scan");
         onGetScan(req);
     });
 
     // ---- Status ----
     _webServer->on("/status", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        LOGD(TAG, "Status");
         onGetStatus(req);
     });
 
@@ -1127,7 +1092,6 @@ void AppConfigManager::registerRoutes() {
     _webServer->on("/save",
                    HTTP_POST,
                    [this](AsyncWebServerRequest* req) {
-        LOGD(TAG, "Save");
         onPostSave(req);
     },
                    nullptr,   // upload handler (not used)
@@ -1140,7 +1104,6 @@ void AppConfigManager::registerRoutes() {
 
     // ---- Exit (web portal only) ----
     _webServer->on("/exit", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        LOGD(TAG, "Exit");
         onGetExit(req);
     });
 
@@ -1149,11 +1112,6 @@ void AppConfigManager::registerRoutes() {
     // Also send a 302 with explicit Location so all OS captive portal
     // detectors follow it correctly.
     _webServer->onNotFound([this](AsyncWebServerRequest* req) {
-        LOGD(TAG, "Not found. URL: %s", req->url().c_str());
-        // req->redirect((WiFi.softAPIP().toString()).c_str());
-        // Captive portal probe paths are registered as explicit routes above,
-        // so anything reaching here is a genuine unknown path — redirect to root.
-        // onGetRoot(req);
         redirectToPortal(req);
     });
 }

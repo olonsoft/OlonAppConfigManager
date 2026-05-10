@@ -7,7 +7,6 @@ AppConfigManager wifiManager(eventBus);
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
     Serial.println("\nStarting...");
 
     // 1. Provide load/save callbacks — library calls these, you handle NVS
@@ -24,7 +23,7 @@ void setup() {
 
     // 2. Tune behaviour (all optional — defaults shown)
     wifiManager.setPortalCredentials("MyDevice-Setup", ""); // open AP
-    wifiManager.setWebPortalPassword(""); // password for web portal (STA mode)
+    wifiManager.setWebPortalPassword("test123"); // password for web portal (STA mode)
     wifiManager.setConnectTimeout(15000);    // 15 s per connection attempt
     wifiManager.setPortalTimeout(180000);    // 3 min captive portal lifetime
     wifiManager.setConnectRetries(3);        // retries per profile before switching
@@ -32,6 +31,11 @@ void setup() {
     wifiManager.setRssiThreshold(-80, 30);  // dBm, check every 30 s
 
     // 3. Subscribe to events
+
+    eventBus.subscribe(EventType::APP_WIFI_STATE_CHANGE, [](EventType, const void* p) {
+        auto* r = static_cast<const StateChangePayload*>(p);
+        Serial.printf("State change : %s → %s\n", wifiManager.getStateString(r->prevState).c_str(), wifiManager.getStateString(r->nextState).c_str());
+    });
 
     eventBus.subscribe(EventType::APP_WIFI_CONNECTING, [](EventType, const void*) {
         Serial.println("WiFi connecting");
@@ -93,11 +97,4 @@ void setup() {
 
 void loop() {
     wifiManager.loop();
-    // For demonstration, print current state every 5 seconds
-    // static unsigned long lastPrint = 0;
-    // if (millis() - lastPrint >= 5000) {
-    //     Serial.print("Current WiFi State: ");
-    //     Serial.println(wifiManager.getStateString(wifiManager.getState()));
-    //     lastPrint = millis();
-    // }
 }

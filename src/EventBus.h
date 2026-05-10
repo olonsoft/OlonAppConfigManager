@@ -5,11 +5,12 @@
 #include <vector>
 
 enum class EventType : uint16_t {
-  // --- Config ---
+    // --- Config ---
     APP_CONFIG_LOADED,
     APP_CONFIG_CHANGED,
 
-  // --- WiFi ---
+    // --- WiFi ---
+    APP_WIFI_STATE_CHANGE,       // Published when state machine changes state
     APP_WIFI_CONNECTING,         // Starting a connection attempt
     APP_WIFI_CONNECTED,          // Fully connected + IP assigned
     APP_WIFI_GOT_IP,             // IP address assigned (may fire before CONNECTED)
@@ -24,18 +25,18 @@ enum class EventType : uint16_t {
     APP_WIFI_CONFIG_SAVED,       // Config written — payload: nullptr
     APP_WIFI_RSSI_LOW,           // RSSI crossed low threshold — payload: RssiPayload*
 
-  // --- OTA ---
+    // --- OTA ---
     APP_OTA_AVAILABLE,
     APP_OTA_PROGRESS,
     APP_OTA_DONE,
     APP_OTA_FAILED,
 
-  // --- MQTT ---
+    // --- MQTT ---
     APP_MQTT_CLIENT_CONNECTED,
     APP_MQTT_CLIENT_DISCONNECTED,
     APP_MQTT_MESSAGE_RECEIVED,
 
-  // --- System ---
+    // --- System ---
     APP_HEARTBEAT,
     APP_FACTORY_RESET_WARNING,
     APP_FACTORY_RESET,
@@ -47,10 +48,10 @@ enum class EventType : uint16_t {
     APP_ERROR_RECOVERABLE,   // flash error pattern once, return to current state
     APP_ERROR_CRITICAL,      // permanent error state, device needs attention
 
-  // Time
+    // Time
     APP_NTP_SYNCED,
 
-  // --- Button ---
+    // --- Button ---
     APP_BUTTON_CLICK,
     APP_BUTTON_DOUBLE_CLICK,
     APP_BUTTON_LONGPRESS_START,
@@ -59,12 +60,12 @@ enum class EventType : uint16_t {
 
     APP_SENSOR_NEW_DATA, // generic event for new sensor data, payload should point to struct with details
 
-  // --- Device custom events ---
-  // Reserve 100-200 for device projects
-  // Usage in device project:
-  // constexpr EventType MY_EVENT = static_cast<EventType>(100);
-  // or
-  // constexpr EventType MY_EVENT = EventType::APP_CUSTOM_EVENT_1;
+    // --- Device custom events ---
+    // Reserve 100-200 for device projects
+    // Usage in device project:
+    // constexpr EventType MY_EVENT = static_cast<EventType>(100);
+    // or
+    // constexpr EventType MY_EVENT = EventType::APP_CUSTOM_EVENT_1;
     APP_CUSTOM_EVENT_1 = 100,
     APP_CUSTOM_EVENT_2 = 101,
     APP_CUSTOM_EVENT_3 = 102,
