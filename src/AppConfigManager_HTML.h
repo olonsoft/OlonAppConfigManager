@@ -14,7 +14,7 @@
 //    GET  /exit     → close web portal (web-portal mode only)
 // ============================================================
 
-static const char HTML_PAGE[] PROGMEM = R"rawliteral(
+static const char htmlContent[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>

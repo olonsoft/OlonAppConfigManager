@@ -117,6 +117,7 @@ enum class AppWiFiState : uint8_t {
     STATE_STARTING_WEB_PORTAL,      // Waiting for server ready
     STATE_WEB_PORTAL_ACTIVE,        // Portal serving; poll for /exit / WiFi drop
     STATE_STOPPING_WEB_PORTAL,      // Teardown server; free memory
+    STATE_WAITING_AP_DOWN,          // Wait for ESP32 lwIP to release AP netif before STA init
 
     // ---- Post-portal re-validation ----
     STATE_RECONNECTING,             // Check if STA is still up after portal closes
@@ -284,6 +285,7 @@ class AppConfigManager {
     void handleState_PortalActive();
     void handleState_PortalComplete();
     void handleState_StoppingCaptivePortal();
+    void handleState_WaitingApDown();
     void handleState_StartWebPortal();
     void handleState_StartingWebPortal();
     void handleState_WebPortalActive();
@@ -395,6 +397,8 @@ class AppConfigManager {
     bool _primaryAuthFailed   = false;
     bool _secondaryAuthFailed = false;
 
+    String _redirectUrl; // Captive portal redirect
+
     bool _intentionalDisconnect = false; // Set by disconnect(); cleared by begin()
     bool _pendingMdnsRestart    = false; // Set when hostname changes; consumed in STATE_MDNS_RESTART
 
@@ -409,6 +413,7 @@ class AppConfigManager {
 
     // Timestamps
     unsigned long _connectStartMs   = 0;
+    unsigned long _apDownStartMs    = 0;   // When softAPdisconnect was called
     unsigned long _portalStartMs    = 0;
     unsigned long _retryWaitStartMs = 0;
     unsigned long _lastSaveMs       = 0;   // Debounce for web portal /save

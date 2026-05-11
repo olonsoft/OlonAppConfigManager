@@ -34,7 +34,10 @@ void setup() {
 
     eventBus.subscribe(EventType::APP_WIFI_STATE_CHANGE, [](EventType, const void* p) {
         auto* r = static_cast<const StateChangePayload*>(p);
-        Serial.printf("State change : %s → %s\n", wifiManager.getStateString(r->prevState).c_str(), wifiManager.getStateString(r->nextState).c_str());
+        Serial.printf("State change : %s → %s\n",
+                      wifiManager.getStateString(r->prevState).c_str(),
+                      wifiManager.getStateString(r->nextState).c_str());
+        Serial.printf("Heap --> %d\n", ESP.getFreeHeap());
     });
 
     eventBus.subscribe(EventType::APP_WIFI_CONNECTING, [](EventType, const void*) {

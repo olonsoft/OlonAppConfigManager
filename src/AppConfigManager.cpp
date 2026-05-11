@@ -30,18 +30,18 @@ static constexpr uint16_t AP_READY_WAIT_MS = 500;    // wait after WiFi.softAP()
 // Captive portal probe paths (no auth, return 200/204)
 static const char* const CAPTIVE_PATHS[] = {
     // all these endpoints will direct to root
-    "/hotspot-detect.html",        // Apple
-    "/library/test/success.html",  // Apple (older)
-    "/generate_204",               // Android / Chrome
-    "/generate204",                // Android too
-    "/gen_204",                    // Android (older)
-    "/ncsi.txt",                   // Windows
-    "/redirect",                   // Android (some)
+    "/hotspot-detect.html",        // * Apple
+    // "/library/test/success.html",  // Apple (older)
+    "/generate_204",               // * Android / Chrome
+    // "/generate204",                // Android too
+    // "/gen_204",                    // Android (older)
+    "/ncsi.txt",                   // * Windows
+    "/redirect",                   // * Android (some)
     "/fwlink",
-    "/canonical.html",             // linux
-    "/probe",
-    "/mtuprobe",
-    "/startpage",
+    "/canonical.html",             // * linux
+    // "/probe",
+    // "/mtuprobe",
+    // "/startpage",
     nullptr,
 };
 
@@ -110,6 +110,14 @@ void AppConfigManager::begin() {
 }
 
 void AppConfigManager::loop() {
+    static uint32_t minHeap = UINT32_MAX;
+    uint32_t        mem     = ESP.getFreeHeap();
+
+    if (mem < minHeap) {
+        minHeap = mem;
+        Serial.printf("Min Heap changed: %u bytes \n", minHeap);
+    }
+
     // Drive mDNS on ESP8266 (ESP32 handles it internally)
 #if defined(ESP8266)
     if (_mdnsActive) {
@@ -142,6 +150,7 @@ void AppConfigManager::loop() {
         case AppWiFiState::STATE_PORTAL_ACTIVE:           handleState_PortalActive(); break;
         case AppWiFiState::STATE_PORTAL_COMPLETE:         handleState_PortalComplete(); break;
         case AppWiFiState::STATE_STOPPING_CAPTIVE_PORTAL: handleState_StoppingCaptivePortal(); break;
+        case AppWiFiState::STATE_WAITING_AP_DOWN:         handleState_WaitingApDown(); break;
         case AppWiFiState::STATE_START_WEB_PORTAL:        handleState_StartWebPortal(); break;
         case AppWiFiState::STATE_STARTING_WEB_PORTAL:     handleState_StartingWebPortal(); break;
         case AppWiFiState::STATE_WEB_PORTAL_ACTIVE:       handleState_WebPortalActive(); break;
@@ -243,6 +252,7 @@ String AppConfigManager::getStateString(AppWiFiState state) const {
         case AppWiFiState::STATE_PORTAL_ACTIVE:           return F("PORTAL_ACTIVE");
         case AppWiFiState::STATE_PORTAL_COMPLETE:         return F("PORTAL_COMPLETE");
         case AppWiFiState::STATE_STOPPING_CAPTIVE_PORTAL: return F("STOPPING_CAPTIVE_PORTAL");
+        case AppWiFiState::STATE_WAITING_AP_DOWN:         return F("WAITING_AP_DOWN");
         case AppWiFiState::STATE_START_WEB_PORTAL:        return F("START_WEB_PORTAL");
         case AppWiFiState::STATE_STARTING_WEB_PORTAL:     return F("STARTING_WEB_PORTAL");
         case AppWiFiState::STATE_WEB_PORTAL_ACTIVE:       return F("WEB_PORTAL_ACTIVE");
@@ -260,7 +270,7 @@ String AppConfigManager::getStateString(AppWiFiState state) const {
 
 void AppConfigManager::transitionTo(AppWiFiState nextState) {
     _prevState = _state;
-    StateChangePayload payload { _prevState, nextState };
+    StateChangePayload payload{ _prevState, nextState };
     _eventBus.publish(EventType::APP_WIFI_STATE_CHANGE, &payload);
     _state = nextState;
 }
@@ -558,6 +568,8 @@ void AppConfigManager::handleState_StartCaptivePortal() {
     _portalSaveComplete = false;
     _saveInProgress     = false;
 
+    _redirectUrl = "http://" + WiFi.softAPIP().toString() + "/";
+
     // Start DNS — redirects all queries to our IP
         // Start DNS — redirects all queries to our IP.
     // Increase buffer beyond the 512-byte default so large EDNS queries
@@ -621,6 +633,11 @@ void AppConfigManager::handleState_PortalComplete() {
 // ============================================================
 
 void AppConfigManager::handleState_StoppingCaptivePortal() {
+    // Tick 1: tear down application-level objects and signal the AP to stop.
+    // Do NOT call WiFi.mode(WIFI_STA) here — on ESP32, the lwIP AP netif is
+    // destroyed asynchronously. Calling WiFi.mode(WIFI_STA) in the same tick
+    // causes wifi_init_default to fail with ESP_ERR_NO_MEM (0x3014) because
+    // the AP netif memory has not been released yet.
     stopWebServer();
 
     if (_dnsServer) {
@@ -629,7 +646,27 @@ void AppConfigManager::handleState_StoppingCaptivePortal() {
         _dnsServer = nullptr;
     }
 
-    WiFi.softAPdisconnect(true);
+    WiFi.softAPdisconnect(true);   // begin AP teardown — async on ESP32
+
+    _apDownStartMs = millis();
+    transitionTo(AppWiFiState::STATE_WAITING_AP_DOWN);
+}
+
+// ============================================================
+//  STATE_WAITING_AP_DOWN
+//  Poll until the AP netif is fully released, then switch to STA.
+//  On ESP8266 the teardown is synchronous so we pass through in one tick.
+//  On ESP32 we poll WiFi.getMode() with a safety timeout of 500 ms.
+// ===========================================================
+
+void AppConfigManager::handleState_WaitingApDown() {
+    // Consider AP down when mode no longer includes AP bit,
+    // or after a safety timeout (should never be needed in practice).
+    bool apGone   = !(WiFi.getMode() & WIFI_AP);
+    bool timedOut = (millis() - _apDownStartMs) >= 500UL;
+
+    if (!apGone && !timedOut) return;   // still waiting — yield to loop()
+
     WiFi.mode(WIFI_STA);
 
     _eventBus.publish(EventType::APP_WIFI_PORTAL_STOPPED);
@@ -640,7 +677,7 @@ void AppConfigManager::handleState_StoppingCaptivePortal() {
         return;
     }
 
-    // After a portal save, start fresh connection with new credentials
+    // Reset connection state for a fresh attempt with (possibly new) credentials
     _activeProfileIndex  = 0;
     _retryCount          = 0;
     _primaryAuthFailed   = false;
@@ -1019,10 +1056,10 @@ void AppConfigManager::stopWebServer() {
 // Helper: Redirect to portal with proper cache-control headers
 void AppConfigManager::redirectToPortal(AsyncWebServerRequest* request) {
     AsyncWebServerResponse* response = request->beginResponse(302);
-    response->addHeader(F("Location"), "http://" + WiFi.softAPIP().toString() + "/");
+    response->addHeader(F("Location"), _redirectUrl);
     response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    response->addHeader("Pragma", "no-cache");
-    response->addHeader("Expires", "-1");
+    // response->addHeader("Pragma", "no-cache");
+    // response->addHeader("Expires", "-1");
     request->send(response);
 }
 
@@ -1038,7 +1075,8 @@ void AppConfigManager::send204(AsyncWebServerRequest* request) {
 void AppConfigManager::setupCaptivePortalHandlers() {
     for (uint8_t i = 0; CAPTIVE_PATHS[i] != nullptr; i++) {
         _webServer->on(CAPTIVE_PATHS[i], HTTP_GET, [this](AsyncWebServerRequest* req) {
-            redirectToPortal(req);
+            // redirectToPortal(req);
+            req->redirect(_redirectUrl);
         });
     }
 
@@ -1048,9 +1086,9 @@ void AppConfigManager::setupCaptivePortalHandlers() {
         request->redirect("http://logout.net");
     });
 
-    _webServer->on("/nm", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        request->send(204, "text/plain", "");
-    });
+    // _webServer->on("/nm", HTTP_GET, [this](AsyncWebServerRequest* request) {
+    //     request->send(204, "text/plain", "");
+    // });
 
     // Others
     _webServer->on("/wpad.dat", HTTP_GET, [this](AsyncWebServerRequest* request) {
@@ -1067,15 +1105,15 @@ void AppConfigManager::setupCaptivePortalHandlers() {
 // ============================================================
 
 void AppConfigManager::registerRoutes() {
+    // ---- Config page ----
+    _webServer->on("/", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        onGetRoot(req);
+    });
+
     setupCaptivePortalHandlers();
 
     _webServer->on("/favicon.ico", HTTP_GET, [this](AsyncWebServerRequest* req) {
         req->send(204, "text/plain", "");
-    });
-
-    // ---- Config page ----
-    _webServer->on("/", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        onGetRoot(req);
     });
 
     // ---- Scan ----
@@ -1140,8 +1178,20 @@ bool AppConfigManager::checkAuth(AsyncWebServerRequest* req) {
 
 void AppConfigManager::onGetRoot(AsyncWebServerRequest* req) {
     if (!checkAuth(req)) return;
-    // HTML is in PROGMEM (AppConfigManager_HTML.h)
-    req->send_P(200, "text/html", HTML_PAGE);
+
+    AsyncWebServerResponse* response =
+        new AsyncProgmemResponse(200, "text/html", (const uint8_t*)htmlContent, sizeof(htmlContent) - 1);
+    req->send(response);
+
+    // // HTML is in PROGMEM (AppConfigManager_HTML.h)
+    // static const size_t htmlContentLength = strlen_P(htmlContent);
+    // // need to cast to uint8_t*
+    // // if you do not, the const char* will be copied in a temporary String buffer
+    // req->send(200, "text/html", (uint8_t*)htmlContent, htmlContentLength);
+
+    // AsyncWebServerResponse* response = req->beginResponse_P(200, "text/html", htmlContent);
+    // req->send(response);
+    // req->send(200, "text/html", htmlContent);
 }
 
 // ============================================================
