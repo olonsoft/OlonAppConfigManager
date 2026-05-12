@@ -13,6 +13,7 @@
 #include <EventBus.h>
 
 #include <functional>
+#include <memory>
 
 #if defined(ESP32)
     #include <ESPmDNS.h>
@@ -91,7 +92,7 @@ enum class AppWiFiState : uint8_t {
 
     // ---- Connected ----
     STATE_CONNECTED,                // Stable connection; RSSI checks run here
-    STATE_MDNS_RESTART,             // Transient: MDNS.end() → next tick → MDNS.begin()
+    STATE_MDNS_RESTART,             // Transient: MDNS.end() -> next tick -> MDNS.begin()
 
     // ---- Connection lost ----
     STATE_CONNECTION_LOST,          // WiFi dropped unexpectedly; brief landing state
@@ -227,12 +228,12 @@ class AppConfigManager {
     // ----------------------------------------------------------
 
     /// Open the web configuration portal while already connected to WiFi.
-    /// Transitions: STATE_CONNECTED → STATE_START_WEB_PORTAL.
+    /// Transitions: STATE_CONNECTED -> STATE_START_WEB_PORTAL.
     /// No-op if not currently in STATE_CONNECTED.
     void startWebPortal();
 
     /// Gracefully close whichever portal is currently active.
-    /// Transitions through STATE_STOPPING_* → STATE_RECONNECTING.
+    /// Transitions through STATE_STOPPING_* -> STATE_RECONNECTING.
     /// No-op if no portal is active.
     void stopPortal();
 
@@ -313,6 +314,11 @@ class AppConfigManager {
     void onPostSave(AsyncWebServerRequest* request);
     void onGetExit(AsyncWebServerRequest* request);
 
+    // Called from loop() on the main task to process a pending save.
+    // All JSON parsing and AppConfig mutation happens here, never inside
+    // the async callback, to avoid stack overflow and WDT reset on ESP8266.
+    void processPendingSave();
+
     // Auth helper — returns false and sends 401 if auth fails
     bool checkAuth(AsyncWebServerRequest* req);
 
@@ -339,9 +345,9 @@ class AppConfigManager {
     //  Connection helpers
     // ----------------------------------------------------------
 
-    WiFiProfile& activeProfile();       // Returns primary or secondary by _activeProfileIndex
+    WiFiProfile& activeProfile();               // Returns primary or secondary by _activeProfileIndex
     void         applyStaticIP();
-    void         promoteSecondaryToPrimary(); // Swap structs + saveConfig()
+    void         promoteSecondaryToPrimary();   // Swap structs + saveConfig()
 
     // ----------------------------------------------------------
     //  RSSI helpers (called inside handleState_Connected)
@@ -403,13 +409,28 @@ class AppConfigManager {
     bool _pendingMdnsRestart    = false; // Set when hostname changes; consumed in STATE_MDNS_RESTART
 
     // Portal save flow
-    bool _portalSaveComplete = false;    // Set in POST /save handler; acted on next tick
-    bool _saveInProgress     = false;    // Guards against concurrent POST /save
-    bool _wifiChangedOnSave  = false;    // True if WiFi credentials changed in last save
+    // NOTE: _portalSaveComplete, _saveInProgress, _wifiChangedOnSave,
+    // _pendingExitRequest, and _pendingSaveReady are written from the
+    // AsyncWebServer callback task (ESP32) and read from the main loop task.
+    // Declared volatile so the compiler does not cache them in registers
+    // across the task boundary.  A full mutex is not used here to avoid
+    // blocking the web-server task; the flags are written once and cleared
+    // by the state machine, making the single-writer/single-reader pattern
+    // safe on both platforms.
+    volatile bool _portalSaveComplete = false;
+    volatile bool _saveInProgress     = false;
+    volatile bool _wifiChangedOnSave  = false;
+    volatile bool _pendingExitRequest = false; // Set by GET /exit handler
+
+    // Deferred-save mechanism (ESP8266 WDT fix).
+    // onPostSave() pauses the request and stores a weak pointer for the main
+    // loop to process. processPendingSave() runs from loop() and does all JSON
+    // work there. The request is only used if it remains valid.
+    volatile bool                           _pendingSaveReady   = false;
+    std::weak_ptr<AsyncWebServerRequest>    _pendingSaveRequest;
 
     // Scan state
-    bool _scanRequested = false;
-    bool _scanRunning   = false;
+    bool _scanRunning = false;
 
     // Timestamps
     unsigned long _connectStartMs   = 0;
@@ -424,6 +445,7 @@ class AppConfigManager {
 
     // POST /save body accumulator (filled by AsyncWebServer body callback)
     String _pendingBody;
+    String _pendingSaveBody; // Copied from _pendingBody when save is deferred.
 
     // mDNS
     bool _mdnsActive = false;

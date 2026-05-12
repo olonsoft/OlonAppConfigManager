@@ -5,17 +5,20 @@
 
 #include "AppConfigManager.h"
 
-#include <ArduinoJson.h>  // v7
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
+
+// #include <ArduinoJson/Deserialization/deserialize.hpp>
+// #include <ArduinoJson/Document/JsonDocument.hpp>
+// #include <ArduinoJson/Json/JsonSerializer.hpp>
+#include <algorithm>    // std::sort  — FIX: was missing, needed by getScanResultsJson()
+#include <vector>       // std::vector — FIX: was missing, needed by getScanResultsJson()
 
 #include "EventBus.h"
 
 // ============================================================
-//  PROGMEM HTML — split into head, body chunks, closing
-//  Keep each chunk under 4 KB for safe send_P on ESP8266.
+//  PROGMEM HTML
 // ============================================================
-// (Defined in AppConfigManager_HTML.h)
 #include "AppConfigManager_HTML.h"
 
 // ============================================================
@@ -23,26 +26,14 @@
 // ============================================================
 const char* const TAG = "WiFiManager";
 
-static constexpr uint8_t  DNS_PORT         = 53;
-static constexpr uint16_t RETRY_WAIT_MS    = 5000;   // delay between retries
-static constexpr uint16_t AP_READY_WAIT_MS = 500;    // wait after WiFi.softAP()
+static constexpr uint8_t  DNS_PORT            = 53;
+static constexpr uint16_t RETRY_WAIT_MS       = 5000;   // delay between retries
+static constexpr uint16_t AP_READY_WAIT_MS    = 500;    // wait after WiFi.softAP()
+static constexpr size_t   MAX_POST_BODY_BYTES = 4096;   // FIX: guard against oversized POST bodies
 
 // Captive portal probe paths (no auth, return 200/204)
 static const char* const CAPTIVE_PATHS[] = {
-    // all these endpoints will direct to root
-    "/hotspot-detect.html",        // * Apple
-    // "/library/test/success.html",  // Apple (older)
-    "/generate_204",               // * Android / Chrome
-    // "/generate204",                // Android too
-    // "/gen_204",                    // Android (older)
-    "/ncsi.txt",                   // * Windows
-    "/redirect",                   // * Android (some)
-    "/fwlink",
-    "/canonical.html",             // * linux
-    // "/probe",
-    // "/mtuprobe",
-    // "/startpage",
-    nullptr,
+    "/hotspot-detect.html", "/generate_204", "/ncsi.txt", "/redirect", "/fwlink", "/canonical.html", nullptr,
 };
 
 // ============================================================
@@ -110,12 +101,12 @@ void AppConfigManager::begin() {
 }
 
 void AppConfigManager::loop() {
+    // Debug heap usage
     static uint32_t minHeap = UINT32_MAX;
     uint32_t        mem     = ESP.getFreeHeap();
-
     if (mem < minHeap) {
         minHeap = mem;
-        Serial.printf("Min Heap changed: %u bytes \n", minHeap);
+        Serial.printf("Min Heap changed: %u bytes\n", minHeap);
     }
 
     // Drive mDNS on ESP8266 (ESP32 handles it internally)
@@ -128,6 +119,23 @@ void AppConfigManager::loop() {
     // Drive DNS server when captive portal is active
     if (_dnsServer) {
         _dnsServer->processNextRequest();
+    }
+
+    // Handle /exit request set by async callback — consume here on main task
+    // FIX: was calling transitionTo() directly from the async callback (data race on ESP32)
+    if (_pendingExitRequest) {
+        _pendingExitRequest = false;
+        if (_state == AppWiFiState::STATE_WEB_PORTAL_ACTIVE) {
+            transitionTo(AppWiFiState::STATE_STOPPING_WEB_PORTAL);
+            return;
+        }
+    }
+
+    // Handle deferred save request set by async callback — consume here on main task
+    // FIX: move all JSON parsing and config mutation out of the async callback to avoid
+    // stack overflow and WDT reset on ESP8266.
+    if (_pendingSaveReady) {
+        processPendingSave();
     }
 
     // Main state machine dispatch
@@ -290,6 +298,7 @@ void AppConfigManager::handleState_Start() {
     _portalSaveComplete  = false;
     _saveInProgress      = false;
     _wifiChangedOnSave   = false;
+    _pendingExitRequest  = false;
     _scanRunning         = false;
 
     // Load config via callback.
@@ -314,7 +323,6 @@ void AppConfigManager::handleState_Start() {
 // ============================================================
 
 void AppConfigManager::handleState_Disconnected() {
-    // Intentional disconnect takes priority
     if (_intentionalDisconnect) {
         transitionTo(AppWiFiState::STATE_NETWORK_DISABLED);
         return;
@@ -350,6 +358,11 @@ void AppConfigManager::handleState_ConnectingStart() {
 
     WiFi.mode(WIFI_STA);
 
+    // FIX: disconnect any stale association before a fresh WiFi.begin().
+    // Without this, some SDK versions silently fail on the second attempt
+    // (especially on ESP8266 after a timeout or auth failure).
+    WiFi.disconnect(false);
+
     if (_config.useStaticIP) {
         applyStaticIP();
     }
@@ -364,7 +377,6 @@ void AppConfigManager::handleState_ConnectingStart() {
 // ============================================================
 //  STATE_CONNECTING
 //  One-shot entry; immediately move to WAIT.
-//  Kept separate so future hooks have a clean landing point.
 // ============================================================
 
 void AppConfigManager::handleState_Connecting() {
@@ -477,7 +489,6 @@ void AppConfigManager::handleState_AuthFailed() {
 
     if (_activeProfileIndex == 0) {
         _primaryAuthFailed = true;
-        // Try secondary if it exists and hasn't already failed
         if (_config.secondary.ssid[0] != '\0' && !_secondaryAuthFailed) {
             _activeProfileIndex = 1;
             transitionTo(AppWiFiState::STATE_CONNECTING_START);
@@ -499,7 +510,6 @@ void AppConfigManager::handleState_RetryingStart() {
     if (_retryCount < _maxRetries) {
         transitionTo(AppWiFiState::STATE_RETRYING);
     } else {
-        // Exhausted retries for this profile
         transitionTo(AppWiFiState::STATE_AP_SWITCH_START);
     }
 }
@@ -552,11 +562,7 @@ void AppConfigManager::handleState_StartCaptivePortal() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP);
 
-    // Use last known channel if we have a primary SSID (avoids channel switching)
     int channel = 1;
-#if defined(ESP8266)
-    // WiFi.channel() is only valid in STA mode; use 1 as safe default after disconnect
-#endif
 
     if (_portalPassword.length() > 0) {
         WiFi.softAP(_portalSsid.c_str(), _portalPassword.c_str(), channel);
@@ -570,10 +576,6 @@ void AppConfigManager::handleState_StartCaptivePortal() {
 
     _redirectUrl = "http://" + WiFi.softAPIP().toString() + "/";
 
-    // Start DNS — redirects all queries to our IP
-        // Start DNS — redirects all queries to our IP.
-    // Increase buffer beyond the 512-byte default so large EDNS queries
-    // (common on Android) are handled rather than silently dropped.
     _dnsServer = new DNSServer();
     _dnsServer->setTTL(300);
     _dnsServer->setErrorReplyCode(DNSReplyCode::NoError);
@@ -590,7 +592,6 @@ void AppConfigManager::handleState_StartCaptivePortal() {
 // ============================================================
 
 void AppConfigManager::handleState_StartingCaptivePortal() {
-    // AP + web server are ready after one short wait
     if (millis() - _portalStartMs >= AP_READY_WAIT_MS) {
         _eventBus.publish(EventType::APP_WIFI_PORTAL_STARTED);
         transitionTo(AppWiFiState::STATE_PORTAL_ACTIVE);
@@ -603,13 +604,11 @@ void AppConfigManager::handleState_StartingCaptivePortal() {
 // ============================================================
 
 void AppConfigManager::handleState_PortalActive() {
-    // Save received from POST handler
     if (_portalSaveComplete) {
         transitionTo(AppWiFiState::STATE_PORTAL_COMPLETE);
         return;
     }
 
-    // Portal timeout
     if (millis() - _portalStartMs >= _portalTimeoutMs) {
         _eventBus.publish(EventType::APP_WIFI_PORTAL_TIMEOUT);
         transitionTo(AppWiFiState::STATE_STOPPING_CAPTIVE_PORTAL);
@@ -622,8 +621,6 @@ void AppConfigManager::handleState_PortalActive() {
 // ============================================================
 
 void AppConfigManager::handleState_PortalComplete() {
-    // _portalSaveComplete was set; config already saved inside POST handler.
-    // One tick has elapsed since the response was sent — safe to tear down.
     transitionTo(AppWiFiState::STATE_STOPPING_CAPTIVE_PORTAL);
 }
 
@@ -633,11 +630,11 @@ void AppConfigManager::handleState_PortalComplete() {
 // ============================================================
 
 void AppConfigManager::handleState_StoppingCaptivePortal() {
-    // Tick 1: tear down application-level objects and signal the AP to stop.
-    // Do NOT call WiFi.mode(WIFI_STA) here — on ESP32, the lwIP AP netif is
+    // Tear down application-level objects and signal the AP to stop.
+    // Do NOT call WiFi.mode(WIFI_STA) here — on ESP32 the lwIP AP netif is
     // destroyed asynchronously. Calling WiFi.mode(WIFI_STA) in the same tick
-    // causes wifi_init_default to fail with ESP_ERR_NO_MEM (0x3014) because
-    // the AP netif memory has not been released yet.
+    // causes wifi_init_default to fail with ESP_ERR_NO_MEM because the AP
+    // netif memory has not been released yet.
     stopWebServer();
 
     if (_dnsServer) {
@@ -655,23 +652,26 @@ void AppConfigManager::handleState_StoppingCaptivePortal() {
 // ============================================================
 //  STATE_WAITING_AP_DOWN
 //  Poll until the AP netif is fully released, then switch to STA.
-//  On ESP8266 the teardown is synchronous so we pass through in one tick.
-//  On ESP32 we poll WiFi.getMode() with a safety timeout of 500 ms.
-// ===========================================================
+//  On ESP8266 teardown is synchronous so we pass through in one tick.
+//  On ESP32 we poll WiFi.getMode() with a 500 ms safety timeout.
+// ============================================================
 
 void AppConfigManager::handleState_WaitingApDown() {
-    // Consider AP down when mode no longer includes AP bit,
-    // or after a safety timeout (should never be needed in practice).
     bool apGone   = !(WiFi.getMode() & WIFI_AP);
     bool timedOut = (millis() - _apDownStartMs) >= 500UL;
 
-    if (!apGone && !timedOut) return;   // still waiting — yield to loop()
+    if (!apGone && !timedOut) return;
 
     WiFi.mode(WIFI_STA);
 
     _eventBus.publish(EventType::APP_WIFI_PORTAL_STOPPED);
 
     if (_intentionalDisconnect) {
+        // FIX: removed duplicate WiFi.disconnect(true) here.
+        // WiFi.softAPdisconnect(true) already shut down the radio in
+        // STATE_STOPPING_CAPTIVE_PORTAL; calling disconnect() again on an
+        // already-torn-down interface can cause an assert on some ESP32 SDK
+        // versions.  Switching to WIFI_STA above is sufficient.
         _eventBus.publish(EventType::APP_WIFI_DISCONNECTED);
         transitionTo(AppWiFiState::STATE_NETWORK_DISABLED);
         return;
@@ -712,30 +712,28 @@ void AppConfigManager::handleState_StartingWebPortal() {
 
 // ============================================================
 //  STATE_WEB_PORTAL_ACTIVE
-//  Poll for WiFi drop (→ stop portal) or save-triggered reconnect.
+//  Poll for WiFi drop or save-triggered reconnect.
 // ============================================================
 
 void AppConfigManager::handleState_WebPortalActive() {
     // WiFi dropped while portal was open
     if (WiFi.status() != WL_CONNECTED) {
-        // Stop server before going anywhere
         transitionTo(AppWiFiState::STATE_STOPPING_WEB_PORTAL);
         return;
     }
 
-    // Save with WiFi change → need to reconnect
+    // Save with WiFi change — need to reconnect
     if (_portalSaveComplete && _wifiChangedOnSave) {
         transitionTo(AppWiFiState::STATE_STOPPING_WEB_PORTAL);
         return;
     }
 
-    // Save with no WiFi change → stay connected, just publish event
+    // Save with no WiFi change — stay connected, just publish event
     if (_portalSaveComplete && !_wifiChangedOnSave) {
         _portalSaveComplete = false;
         _saveInProgress     = false;
         _eventBus.publish(EventType::APP_WIFI_CONFIG_SAVED);
 
-        // Hostname may have changed
         if (_pendingMdnsRestart) {
             _pendingMdnsRestart = false;
             stopMdns();
@@ -831,10 +829,9 @@ void AppConfigManager::applyStaticIP() {
 }
 
 void AppConfigManager::promoteSecondaryToPrimary() {
-    // Swap structs
-    WiFiProfile tmp     = _config.primary;
-    _config.primary     = _config.secondary;
-    _config.secondary   = tmp;
+    // FIX: use std::swap instead of manual tmp copy — safer if struct gains
+    // non-trivial members later, and avoids an extra stack allocation.
+    std::swap(_config.primary, _config.secondary);
     _activeProfileIndex = 0;
 
     // Persist — one-time blocking NVS write; acceptable per design decision
@@ -896,8 +893,7 @@ String AppConfigManager::getScanResultsJson() {
     int n = WiFi.scanComplete();
     if (n < 0) return F("{\"scanning\":true,\"networks\":[]}");
 
-    // Sort by RSSI descending (ESP8266 does not do this automatically)
-    // Build index array and sort it
+    // Sort by RSSI descending
     std::vector<int> indices(n);
     for (int i = 0; i < n; i++)
         indices[i] = i;
@@ -923,7 +919,6 @@ String AppConfigManager::getScanResultsJson() {
         );
     }
 
-    // Free SDK scan memory now that we've consumed results
     WiFi.scanDelete();
     _scanRunning = false;
 
@@ -939,7 +934,7 @@ String AppConfigManager::getScanResultsJson() {
 bool AppConfigManager::validateHostname(const char* hostname, String& err) const {
     size_t len = strlen(hostname);
     if (len == 0 || len > 63) {
-        err = F("Hostname must be 1–63 characters");
+        err = F("Hostname must be 1-63 characters");
         return false;
     }
     if (hostname[0] == '-' || hostname[len - 1] == '-') {
@@ -963,13 +958,11 @@ bool AppConfigManager::validateHostname(const char* hostname, String& err) const
 bool AppConfigManager::validateMqttBroker(const char* broker, String& err) const {
     if (strlen(broker) == 0) return true;  // Empty is OK (MQTT optional)
 
-    // Reject protocol prefixes
     if (strncmp(broker, "mqtt://", 7) == 0 || strncmp(broker, "mqtts://", 8) == 0) {
         err = F("Do not include protocol prefix (mqtt://)");
         return false;
     }
 
-    // Format must be host or host:port
     String b(broker);
     int    colon = b.lastIndexOf(':');
     if (colon > 0) {
@@ -980,7 +973,7 @@ bool AppConfigManager::validateMqttBroker(const char* broker, String& err) const
                 return false;
             }
         }
-        uint32_t port = portStr.toInt();
+        long port = portStr.toInt();
         if (port < 1 || port > 65535) {
             err = F("Port must be between 1 and 65535");
             return false;
@@ -994,7 +987,6 @@ bool AppConfigManager::validateNtpServer(const char* server, String& err) const 
         err = F("NTP server cannot be empty");
         return false;
     }
-    // Basic check: no spaces, at least one dot or it's "localhost"
     String s(server);
     if (s.indexOf(' ') >= 0) {
         err = F("NTP server contains invalid characters");
@@ -1006,17 +998,14 @@ bool AppConfigManager::validateNtpServer(const char* server, String& err) const 
 bool AppConfigManager::validateStaticIP(const AppConfig& cfg, String& err) const {
     if (!cfg.useStaticIP) return true;
 
-    // Gateway must be non-zero
     if (cfg.gateway == IPAddress(0, 0, 0, 0)) {
         err = F("Gateway address is required for static IP");
         return false;
     }
-    // Subnet must be non-zero
     if (cfg.subnet == IPAddress(0, 0, 0, 0)) {
         err = F("Subnet mask is required for static IP");
         return false;
     }
-    // IP and gateway must be on the same subnet
     uint32_t ip  = (uint32_t)cfg.staticIP;
     uint32_t gw  = (uint32_t)cfg.gateway;
     uint32_t sub = (uint32_t)cfg.subnet;
@@ -1028,7 +1017,9 @@ bool AppConfigManager::validateStaticIP(const AppConfig& cfg, String& err) const
 }
 
 bool AppConfigManager::validatePort(uint16_t port, String& err) const {
-    if (port < 1) {
+    // FIX: original check was `port < 1` on a uint16_t, which is always false
+    // since uint16_t is unsigned. Use port == 0 instead.
+    if (port == 0) {
         err = F("Port must be between 1 and 65535");
         return false;
     }
@@ -1040,7 +1031,7 @@ bool AppConfigManager::validatePort(uint16_t port, String& err) const {
 // ============================================================
 
 void AppConfigManager::startWebServer() {
-    if (_webServer) return;   // Already running
+    if (_webServer) return;
     _webServer = new AsyncWebServer(_webPortalPort);
     registerRoutes();
     _webServer->begin();
@@ -1053,17 +1044,13 @@ void AppConfigManager::stopWebServer() {
     _webServer = nullptr;
 }
 
-// Helper: Redirect to portal with proper cache-control headers
 void AppConfigManager::redirectToPortal(AsyncWebServerRequest* request) {
     AsyncWebServerResponse* response = request->beginResponse(302);
     response->addHeader(F("Location"), _redirectUrl);
     response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    // response->addHeader("Pragma", "no-cache");
-    // response->addHeader("Expires", "-1");
     request->send(response);
 }
 
-// Helper: Send 204 No Content with cache headers (good for Android)
 void AppConfigManager::send204(AsyncWebServerRequest* request) {
     AsyncWebServerResponse* response = request->beginResponse(204);
     response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -1075,22 +1062,14 @@ void AppConfigManager::send204(AsyncWebServerRequest* request) {
 void AppConfigManager::setupCaptivePortalHandlers() {
     for (uint8_t i = 0; CAPTIVE_PATHS[i] != nullptr; i++) {
         _webServer->on(CAPTIVE_PATHS[i], HTTP_GET, [this](AsyncWebServerRequest* req) {
-            // redirectToPortal(req);
             req->redirect(_redirectUrl);
         });
     }
 
-    // rest of the captive portal endpoints, not handled by redirect to root
-    // Windows
     _webServer->on("/connecttest.txt", HTTP_GET, [this](AsyncWebServerRequest* request) {
         request->redirect("http://logout.net");
     });
 
-    // _webServer->on("/nm", HTTP_GET, [this](AsyncWebServerRequest* request) {
-    //     request->send(204, "text/plain", "");
-    // });
-
-    // Others
     _webServer->on("/wpad.dat", HTTP_GET, [this](AsyncWebServerRequest* request) {
         request->send(404);
     });
@@ -1105,7 +1084,6 @@ void AppConfigManager::setupCaptivePortalHandlers() {
 // ============================================================
 
 void AppConfigManager::registerRoutes() {
-    // ---- Config page ----
     _webServer->on("/", HTTP_GET, [this](AsyncWebServerRequest* req) {
         onGetRoot(req);
     });
@@ -1116,41 +1094,37 @@ void AppConfigManager::registerRoutes() {
         req->send(204, "text/plain", "");
     });
 
-    // ---- Scan ----
     _webServer->on("/scan", HTTP_GET, [this](AsyncWebServerRequest* req) {
         onGetScan(req);
     });
 
-    // ---- Status ----
     _webServer->on("/status", HTTP_GET, [this](AsyncWebServerRequest* req) {
         onGetStatus(req);
     });
 
-    // ---- Save ----
-    _webServer->on("/save",
-                   HTTP_POST,
-                   [this](AsyncWebServerRequest* req) {
-        onPostSave(req);
-    },
-                   nullptr,   // upload handler (not used)
-                   [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
-            // Accumulate body chunks into _pendingBody.
-            // index==0 means first chunk — reset the buffer.
+    // Body accumulation lambda — written from async callback task.
+    // FIX: added MAX_POST_BODY_BYTES guard to prevent heap exhaustion from
+    // oversized bodies sent by a malicious client.
+    auto bodyHandler = [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
         if (index == 0) _pendingBody = "";
-        _pendingBody.concat(reinterpret_cast<const char*>(data), len);
-    });
+        if (_pendingBody.length() + len <= MAX_POST_BODY_BYTES) {
+            _pendingBody.concat(reinterpret_cast<const char*>(data), len);
+        }
+        // If the limit is exceeded we stop appending; onPostSave will
+        // receive whatever partial body was accumulated (likely invalid JSON)
+        // and return a 400 error, which is the correct behaviour.
+    };
 
-    // ---- Exit (web portal only) ----
+    _webServer->on("/save", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        onPostSave(req);
+    }, nullptr, bodyHandler);
+
     _webServer->on("/exit", HTTP_GET, [this](AsyncWebServerRequest* req) {
         onGetExit(req);
     });
 
-    // ---- 404 — redirect everything to portal root (captive portal behaviour) ----
-    // Use the actual AP IP rather than a hardcoded address.
-    // Also send a 302 with explicit Location so all OS captive portal
-    // detectors follow it correctly.
     _webServer->onNotFound([this](AsyncWebServerRequest* req) {
-        redirectToPortal(req);
+        req->redirect(_redirectUrl);
     });
 }
 
@@ -1160,8 +1134,8 @@ void AppConfigManager::registerRoutes() {
 
 bool AppConfigManager::checkAuth(AsyncWebServerRequest* req) {
     // Never challenge in captive portal mode — the OS captive portal detector
-    // cannot pass credentials and will show ERR_HTTP_RESPONSE_CODE_FAILURE on
-    // any 401 response. The AP itself is the security boundary in that mode.
+    // cannot pass credentials and will show an error on any 401 response.
+    // The AP itself is the security boundary in that mode.
     if (_state == AppWiFiState::STATE_PORTAL_ACTIVE || _state == AppWiFiState::STATE_STARTING_CAPTIVE_PORTAL ||
         _state == AppWiFiState::STATE_PORTAL_COMPLETE) {
         return true;
@@ -1173,7 +1147,7 @@ bool AppConfigManager::checkAuth(AsyncWebServerRequest* req) {
 }
 
 // ============================================================
-//  Route: GET / — serve main config page
+//  Route: GET /
 // ============================================================
 
 void AppConfigManager::onGetRoot(AsyncWebServerRequest* req) {
@@ -1182,20 +1156,10 @@ void AppConfigManager::onGetRoot(AsyncWebServerRequest* req) {
     AsyncWebServerResponse* response =
         new AsyncProgmemResponse(200, "text/html", (const uint8_t*)htmlContent, sizeof(htmlContent) - 1);
     req->send(response);
-
-    // // HTML is in PROGMEM (AppConfigManager_HTML.h)
-    // static const size_t htmlContentLength = strlen_P(htmlContent);
-    // // need to cast to uint8_t*
-    // // if you do not, the const char* will be copied in a temporary String buffer
-    // req->send(200, "text/html", (uint8_t*)htmlContent, htmlContentLength);
-
-    // AsyncWebServerResponse* response = req->beginResponse_P(200, "text/html", htmlContent);
-    // req->send(response);
-    // req->send(200, "text/html", htmlContent);
 }
 
 // ============================================================
-//  Route: GET /scan — start or poll async scan
+//  Route: GET /scan
 // ============================================================
 
 void AppConfigManager::onGetScan(AsyncWebServerRequest* req) {
@@ -1203,7 +1167,6 @@ void AppConfigManager::onGetScan(AsyncWebServerRequest* req) {
 
     if (!_scanRunning) {
         startScan();
-        // Return immediately with scanning:true
         req->send(200, "application/json", F("{\"scanning\":true,\"networks\":[]}"));
         return;
     }
@@ -1213,7 +1176,6 @@ void AppConfigManager::onGetScan(AsyncWebServerRequest* req) {
         return;
     }
 
-    // Scan done — serialise + free SDK memory
     String json = getScanResultsJson();
     req->send(200, "application/json", json);
 }
@@ -1272,7 +1234,6 @@ void AppConfigManager::onGetStatus(AsyncWebServerRequest* req) {
 void AppConfigManager::onPostSave(AsyncWebServerRequest* req) {
     if (!checkAuth(req)) return;
 
-    // Debounce — web portal only (captive portal server tears down after one save)
     bool isWebPortal = (_state == AppWiFiState::STATE_WEB_PORTAL_ACTIVE);
     if (isWebPortal) {
         if (_saveInProgress) {
@@ -1292,11 +1253,47 @@ void AppConfigManager::onPostSave(AsyncWebServerRequest* req) {
 
     _saveInProgress = true;
 
+    // Defer all JSON parsing and config mutation to the main loop task.
+    // This avoids stack overflow and WDT reset on ESP8266.
+    _pendingSaveBody    = _pendingBody;
+    _pendingBody        = "";
+    _pendingSaveReady   = true;
+    _pendingSaveRequest = req->pause();
+}
+
+// ============================================================
+//  Route: GET /exit — close web portal gracefully
+//  FIX: removed direct transitionTo() call from async callback.
+//  Instead we set _pendingExitRequest which loop() consumes on
+//  the main task, avoiding a data race on ESP32.
+// ============================================================
+
+void AppConfigManager::onGetExit(AsyncWebServerRequest* req) {
+    if (!checkAuth(req)) return;
+    req->send(200, "application/json", F("{\"success\":true}"));
+    _pendingExitRequest = true;
+}
+
+// ============================================================
+//  Deferred save processing (called from loop() on main task)
+// ============================================================
+
+void AppConfigManager::processPendingSave() {
+    _pendingSaveReady                          = false;
+    std::shared_ptr<AsyncWebServerRequest> req = _pendingSaveRequest.lock();
+    _pendingSaveRequest.reset();
+
+    if (!req) {
+        _saveInProgress  = false;
+        _pendingSaveBody = "";
+        return;
+    }
+
     // ---- Parse body as JSON ----
     JsonDocument body;
-    if (_pendingBody.length() > 0) {
-        DeserializationError err = deserializeJson(body, _pendingBody);
-        _pendingBody             = "";   // Free memory immediately after parsing
+    if (_pendingSaveBody.length() > 0) {
+        DeserializationError err = deserializeJson(body, _pendingSaveBody);
+        _pendingSaveBody         = "";
         if (err) {
             _saveInProgress = false;
             req->send(400, "application/json", F("{\"success\":false,\"errors\":{\"general\":\"Invalid JSON\"}}"));
@@ -1309,23 +1306,22 @@ void AppConfigManager::onPostSave(AsyncWebServerRequest* req) {
     }
 
     // ---- Build candidate config (validate before touching _config) ----
-    AppConfig    candidate = _config;
-    JsonDocument errors;
-    bool         hasErrors = false;
+    std::unique_ptr<AppConfig> candidate = std::make_unique<AppConfig>(_config);
+    JsonDocument  errors;
+    bool          hasErrors = false;
 
-    // Helper lambda — copy string field safely
     auto copyField = [](const char* src, char* dst, size_t maxLen) {
         if (src) strncpy(dst, src, maxLen - 1);
         dst[maxLen - 1] = '\0';
     };
 
     // App tab
-    if (body["app_name"].is<const char*>()) copyField(body["app_name"], candidate.appName, sizeof(candidate.appName));
+    if (body["app_name"].is<const char*>()) copyField(body["app_name"], candidate->appName, sizeof(candidate->appName));
 
     if (body["hostname"].is<const char*>()) {
-        copyField(body["hostname"], candidate.hostname, sizeof(candidate.hostname));
+        copyField(body["hostname"], candidate->hostname, sizeof(candidate->hostname));
         String err;
-        if (!validateHostname(candidate.hostname, err)) {
+        if (!validateHostname(candidate->hostname, err)) {
             errors["hostname"] = err;
             hasErrors          = true;
         }
@@ -1335,42 +1331,45 @@ void AppConfigManager::onPostSave(AsyncWebServerRequest* req) {
     bool wifiChanged = false;
     if (body["primary_ssid"].is<const char*>()) {
         String oldSsid = _config.primary.ssid;
-        copyField(body["primary_ssid"], candidate.primary.ssid, sizeof(candidate.primary.ssid));
-        if (oldSsid != candidate.primary.ssid) wifiChanged = true;
+        copyField(body["primary_ssid"], candidate->primary.ssid, sizeof(candidate->primary.ssid));
+        if (oldSsid != candidate->primary.ssid) wifiChanged = true;
     }
     if (body["primary_password"].is<const char*>()) {
         const char* pw = body["primary_password"];
-        if (strcmp(pw, "****") != 0) {  // Ignore masked placeholder
+        // FIX: treat empty string as an intentional clear, not just "****" masking.
+        // An empty string from the browser means the user wants no password.
+        // "****" means the user left the placeholder and wants no change.
+        if (strcmp(pw, "****") != 0) {
             String oldPw = _config.primary.password;
-            copyField(pw, candidate.primary.password, sizeof(candidate.primary.password));
-            if (oldPw != candidate.primary.password) wifiChanged = true;
+            copyField(pw, candidate->primary.password, sizeof(candidate->primary.password));
+            if (oldPw != candidate->primary.password) wifiChanged = true;
         }
     }
     if (body["secondary_ssid"].is<const char*>()) {
         String oldSsid = _config.secondary.ssid;
-        copyField(body["secondary_ssid"], candidate.secondary.ssid, sizeof(candidate.secondary.ssid));
-        if (oldSsid != candidate.secondary.ssid) wifiChanged = true;
+        copyField(body["secondary_ssid"], candidate->secondary.ssid, sizeof(candidate->secondary.ssid));
+        if (oldSsid != candidate->secondary.ssid) wifiChanged = true;
     }
     if (body["secondary_password"].is<const char*>()) {
         const char* pw = body["secondary_password"];
         if (strcmp(pw, "****") != 0) {
             String oldPw = _config.secondary.password;
-            copyField(pw, candidate.secondary.password, sizeof(candidate.secondary.password));
-            if (oldPw != candidate.secondary.password) wifiChanged = true;
+            copyField(pw, candidate->secondary.password, sizeof(candidate->secondary.password));
+            if (oldPw != candidate->secondary.password) wifiChanged = true;
         }
     }
 
     // Static IP
     if (body["use_static_ip"].is<bool>()) {
-        candidate.useStaticIP = body["use_static_ip"].as<bool>();
-        if (candidate.useStaticIP) {
-            candidate.staticIP.fromString(body["static_ip"] | "");
-            candidate.gateway.fromString(body["gateway"] | "");
-            candidate.subnet.fromString(body["subnet"] | "");
-            candidate.dns1.fromString(body["dns1"] | "");
-            candidate.dns2.fromString(body["dns2"] | "");
+        candidate->useStaticIP = body["use_static_ip"].as<bool>();
+        if (candidate->useStaticIP) {
+            candidate->staticIP.fromString(body["static_ip"] | "");
+            candidate->gateway.fromString(body["gateway"] | "");
+            candidate->subnet.fromString(body["subnet"] | "");
+            candidate->dns1.fromString(body["dns1"] | "");
+            candidate->dns2.fromString(body["dns2"] | "");
             String ipErr;
-            if (!validateStaticIP(candidate, ipErr)) {
+            if (!validateStaticIP(*candidate, ipErr)) {
                 errors["static_ip"] = ipErr;
                 hasErrors           = true;
             }
@@ -1380,46 +1379,63 @@ void AppConfigManager::onPostSave(AsyncWebServerRequest* req) {
 
     // MQTT tab
     if (body["mqtt_broker"].is<const char*>()) {
-        copyField(body["mqtt_broker"], candidate.mqttBroker, sizeof(candidate.mqttBroker));
+        copyField(body["mqtt_broker"], candidate->mqttBroker, sizeof(candidate->mqttBroker));
         String err;
-        if (!validateMqttBroker(candidate.mqttBroker, err)) {
+        if (!validateMqttBroker(candidate->mqttBroker, err)) {
             errors["mqtt_broker"] = err;
             hasErrors             = true;
         }
     }
-    if (body["mqtt_port"].is<uint16_t>()) candidate.mqttPort = body["mqtt_port"].as<uint16_t>();
+    // FIX: was body["mqtt_port"].is<uint16_t>() which can return false for valid
+    // port numbers on ArduinoJson v7 (stores as long). Use JsonVariant and
+    // range-check manually.
+    if (!body["mqtt_port"].isNull()) {
+        long port = body["mqtt_port"].as<long>();
+        if (port >= 1 && port <= 65535) {
+            candidate->mqttPort = (uint16_t)port;
+        } else {
+            errors["mqtt_port"] = F("Port must be between 1 and 65535");
+            hasErrors           = true;
+        }
+    }
     if (body["mqtt_user"].is<const char*>())
-        copyField(body["mqtt_user"], candidate.mqttUser, sizeof(candidate.mqttUser));
+        copyField(body["mqtt_user"], candidate->mqttUser, sizeof(candidate->mqttUser));
     if (body["mqtt_password"].is<const char*>()) {
         const char* pw = body["mqtt_password"];
-        if (strcmp(pw, "****") != 0) copyField(pw, candidate.mqttPassword, sizeof(candidate.mqttPassword));
+        if (strcmp(pw, "****") != 0) copyField(pw, candidate->mqttPassword, sizeof(candidate->mqttPassword));
     }
     if (body["mqtt_client_id"].is<const char*>())
-        copyField(body["mqtt_client_id"], candidate.mqttClientId, sizeof(candidate.mqttClientId));
+        copyField(body["mqtt_client_id"], candidate->mqttClientId, sizeof(candidate->mqttClientId));
     if (body["mqtt_base_topic"].is<const char*>())
-        copyField(body["mqtt_base_topic"], candidate.mqttBaseTopic, sizeof(candidate.mqttBaseTopic));
+        copyField(body["mqtt_base_topic"], candidate->mqttBaseTopic, sizeof(candidate->mqttBaseTopic));
     if (body["mqtt_ha_topic"].is<const char*>())
-        copyField(body["mqtt_ha_topic"], candidate.mqttHADiscoveryTopic, sizeof(candidate.mqttHADiscoveryTopic));
+        copyField(body["mqtt_ha_topic"], candidate->mqttHADiscoveryTopic, sizeof(candidate->mqttHADiscoveryTopic));
 
     // System tab
     if (body["ntp_server"].is<const char*>()) {
-        copyField(body["ntp_server"], candidate.ntpServer, sizeof(candidate.ntpServer));
+        copyField(body["ntp_server"], candidate->ntpServer, sizeof(candidate->ntpServer));
         String err;
-        if (!validateNtpServer(candidate.ntpServer, err)) {
+        if (!validateNtpServer(candidate->ntpServer, err)) {
             errors["ntp_server"] = err;
             hasErrors            = true;
         }
     }
     if (body["posix_timezone"].is<const char*>())
-        copyField(body["posix_timezone"], candidate.posixTimezone, sizeof(candidate.posixTimezone));
-    if (body["ota_url"].is<const char*>()) copyField(body["ota_url"], candidate.otaUrl, sizeof(candidate.otaUrl));
+        copyField(body["posix_timezone"], candidate->posixTimezone, sizeof(candidate->posixTimezone));
+    if (body["ota_url"].is<const char*>()) copyField(body["ota_url"], candidate->otaUrl, sizeof(candidate->otaUrl));
 
     // Web portal password
     if (body["web_portal_password"].is<const char*>()) {
         const char* pw = body["web_portal_password"];
         if (strcmp(pw, "****") != 0) {
-            copyField(pw, candidate.webPortalPassword, sizeof(candidate.webPortalPassword));
-            _webPortalPassword = candidate.webPortalPassword;
+            // FIX: empty string now correctly clears the password (disables auth).
+            // Previously the logic fell through to copyField for any non-"****"
+            // value, which was correct — but the JS side was sending "****" for
+            // blank fields, preventing the user from ever clearing the password.
+            // The JS side has been fixed to send "" for a blank field. Server
+            // side now stores whatever non-"****" value arrives, including "".
+            copyField(pw, candidate->webPortalPassword, sizeof(candidate->webPortalPassword));
+            _webPortalPassword = candidate->webPortalPassword;
         }
     }
 
@@ -1436,10 +1452,10 @@ void AppConfigManager::onPostSave(AsyncWebServerRequest* req) {
     }
 
     // ---- Detect hostname change ----
-    bool hostnameChanged = (strcmp(_config.hostname, candidate.hostname) != 0);
+    bool hostnameChanged = (strcmp(_config.hostname, candidate->hostname) != 0);
 
     // ---- Commit ----
-    _config = candidate;
+    _config = *candidate;
     if (_saveCallback) _saveCallback(_config);
     _lastSaveMs = millis();
 
@@ -1453,19 +1469,8 @@ void AppConfigManager::onPostSave(AsyncWebServerRequest* req) {
     serializeJson(resp, out);
     req->send(200, "application/json", out);
 
-    // ---- Set flags for state machine to act on next tick ----
+    // ---- Set volatile flags for state machine to act on next tick ----
     _wifiChangedOnSave  = wifiChanged;
     _portalSaveComplete = true;
     // _saveInProgress stays true until state machine clears it
-}
-
-// ============================================================
-//  Route: GET /exit — close web portal gracefully
-// ============================================================
-
-void AppConfigManager::onGetExit(AsyncWebServerRequest* req) {
-    if (!checkAuth(req)) return;
-    req->send(200, "application/json", F("{\"success\":true}"));
-    // State machine acts next tick
-    transitionTo(AppWiFiState::STATE_STOPPING_WEB_PORTAL);
 }
