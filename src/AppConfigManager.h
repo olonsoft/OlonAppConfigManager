@@ -13,7 +13,6 @@
 #include <EventBus.h>
 
 #include <functional>
-#include <memory>
 
 #if defined(ESP32)
     #include <ESPmDNS.h>
@@ -23,10 +22,13 @@
     #include <ESP8266mDNS.h>
 #endif
 
+#include <DNSServer.h>
+#include <ESPAsyncWebServer.h>
+
 // Forward declarations — actual headers included in .cpp only
-class AsyncWebServer;
-class DNSServer;
-class AsyncWebServerRequest;
+// class AsyncWebServer;
+// class DNSServer;
+// class AsyncWebServerRequest;
 
 // ============================================================
 //  AppConfig struct
@@ -422,12 +424,14 @@ class AppConfigManager {
     volatile bool _wifiChangedOnSave  = false;
     volatile bool _pendingExitRequest = false; // Set by GET /exit handler
 
+    uint32_t _portalCompleteMs = 0;
     // Deferred-save mechanism (ESP8266 WDT fix).
-    // onPostSave() pauses the request and stores a weak pointer for the main
-    // loop to process. processPendingSave() runs from loop() and does all JSON
-    // work there. The request is only used if it remains valid.
-    volatile bool                           _pendingSaveReady   = false;
-    std::weak_ptr<AsyncWebServerRequest>    _pendingSaveRequest;
+    // onPostSave() stores the raw request pointer and sets _pendingSaveReady.
+    // processPendingSave() runs from loop() and does all JSON work there.
+    // The pointer is valid until we call req->send(), which we do inside
+    // processPendingSave() before clearing the flag.
+    volatile bool              _pendingSaveReady   = false;
+    AsyncWebServerRequestPtr   _pendingSaveRequest; //weak_ptr
 
     // Scan state
     bool _scanRunning = false;
@@ -445,7 +449,6 @@ class AppConfigManager {
 
     // POST /save body accumulator (filled by AsyncWebServer body callback)
     String _pendingBody;
-    String _pendingSaveBody; // Copied from _pendingBody when save is deferred.
 
     // mDNS
     bool _mdnsActive = false;
