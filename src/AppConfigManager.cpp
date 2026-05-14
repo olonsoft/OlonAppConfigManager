@@ -1309,7 +1309,6 @@ void AppConfigManager::processPendingSave() {
     };
 
     // App tab
-    LOGD(TAG, "validating App tab");
     if ((*body)["app_name"].is<const char*>())
         copyField((*body)["app_name"], candidate->appName, sizeof(candidate->appName));
 
@@ -1323,7 +1322,6 @@ void AppConfigManager::processPendingSave() {
     }
 
     // WiFi tab
-    LOGD(TAG, "validating WiFi tab");
     bool wifiChanged = false;
 
     if ((*body)["primary_ssid"].is<const char*>()) {
@@ -1351,7 +1349,6 @@ void AppConfigManager::processPendingSave() {
     }
 
     // Static IP
-    LOGD(TAG, "validating static IP");
     if ((*body)["use_static_ip"].is<bool>()) {
         candidate->useStaticIP = (*body)["use_static_ip"].as<bool>();
         if (candidate->useStaticIP) {
@@ -1370,7 +1367,6 @@ void AppConfigManager::processPendingSave() {
     }
 
     // MQTT tab
-    LOGD(TAG, "validating MQTT tab");
     if ((*body)["mqtt_broker"].is<const char*>()) {
         copyField((*body)["mqtt_broker"], candidate->mqttBroker, sizeof(candidate->mqttBroker));
         errMsg = "";
@@ -1456,7 +1452,6 @@ void AppConfigManager::processPendingSave() {
     if (hostnameChanged) _pendingMdnsRestart = true;
 
     // ---- Send success response ----
-    LOGD(TAG, "sending success response");
     String out;
     {
         auto resp               = std::make_unique<JsonDocument>();
