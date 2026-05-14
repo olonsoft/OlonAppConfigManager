@@ -40,20 +40,24 @@ void setup() {
         Serial.printf("Heap --> %d\n", ESP.getFreeHeap());
     });
 
-    eventBus.subscribe(EventType::APP_WIFI_CONNECTING, [](EventType, const void*) {
-        Serial.println("WiFi connecting");
+    eventBus.subscribe(EventType::APP_WIFI_CONNECTING, [](EventType, const void* p) {
+        auto* r = static_cast<const ConnectionInfoPayload*>(p);
+        Serial.printf("WiFi connecting to %s\n", r->ssid);
     });
 
-    eventBus.subscribe(EventType::APP_WIFI_CONNECTED, [](EventType, const void*) {
-        Serial.println("WiFi connected");
+    eventBus.subscribe(EventType::APP_WIFI_CONNECTED, [](EventType, const void* p) {
+        auto* r = static_cast<const ConnectionInfoPayload*>(p);
+        Serial.printf("WiFi connected to %s\n", r->ssid);
     });
 
-    eventBus.subscribe(EventType::APP_WIFI_GOT_IP, [](EventType, const void*) {
-        Serial.println("WiFi got IP");
+    eventBus.subscribe(EventType::APP_WIFI_GOT_IP, [](EventType, const void* p) {
+        auto* r = static_cast<const ConnectionInfoPayload*>(p);
+        Serial.printf("WiFi %s got IP %s\n", r->ssid, r->ip.toString().c_str());
     });
 
-    eventBus.subscribe(EventType::APP_WIFI_DISCONNECTED, [](EventType, const void*) {
-        Serial.println("WiFi disconnected");
+    eventBus.subscribe(EventType::APP_WIFI_DISCONNECTED, [](EventType, const void* p) {
+        auto* r = static_cast<const ConnectionInfoPayload*>(p);
+        Serial.printf("WiFi disconnected from %s\n", r->ssid);
     });
 
     eventBus.subscribe(EventType::APP_WIFI_AUTH_FAILED, [](EventType, const void*) {

@@ -758,7 +758,7 @@ function doSave() {
       if (errs.general) {
         msg.textContent = '\u2717 ' + errs.general;
       } else {
-        msg.textContent = '\u2717 Please fix the errors below';
+        msg.textContent = '\u2717 Please fix the errors in red above';
       }
       msg.className = 'msg-err';
 

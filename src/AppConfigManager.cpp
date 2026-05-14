@@ -225,7 +225,9 @@ void AppConfigManager::disconnect() {
     } else {
         WiFi.disconnect(true);
         transitionTo(AppWiFiState::STATE_NETWORK_DISABLED);
-        _eventBus.publish(EventType::APP_WIFI_DISCONNECTED);
+        WiFiProfile&          profile = activeProfile();
+        ConnectionInfoPayload connectionInfo{ profile.ssid, IPAddress(0, 0, 0, 0) };
+        _eventBus.publish(EventType::APP_WIFI_DISCONNECTED, &connectionInfo);
     }
 }
 
@@ -383,8 +385,8 @@ void AppConfigManager::handleState_ConnectingStart() {
 
     WiFi.begin(profile.ssid, profile.password);
     _connectStartMs = millis();
-
-    _eventBus.publish(EventType::APP_WIFI_CONNECTING);
+    ConnectionInfoPayload connectionInfo{ profile.ssid, IPAddress(0, 0, 0, 0) };
+    _eventBus.publish(EventType::APP_WIFI_CONNECTING, &connectionInfo);
     transitionTo(AppWiFiState::STATE_CONNECTING);
 }
 
@@ -407,12 +409,15 @@ void AppConfigManager::handleState_ConnectingWait() {
         if (_activeProfileIndex == 1) {
             promoteSecondaryToPrimary();
         }
-        _eventBus.publish(EventType::APP_WIFI_GOT_IP);
+        WiFiProfile&          profile = activeProfile();
+        ConnectionInfoPayload connectionInfo{ profile.ssid, WiFi.localIP() };
+
+        _eventBus.publish(EventType::APP_WIFI_GOT_IP, &connectionInfo);
         startMdns();
         _rssiLowPublished = false;
         _lastRssiCheckMs  = millis();
         transitionTo(AppWiFiState::STATE_CONNECTED);
-        _eventBus.publish(EventType::APP_WIFI_CONNECTED);
+        _eventBus.publish(EventType::APP_WIFI_CONNECTED, &connectionInfo);
         return;
     }
 
@@ -467,7 +472,9 @@ void AppConfigManager::handleState_MdnsRestart() {
 
 void AppConfigManager::handleState_ConnectionLost() {
     stopMdns();
-    _eventBus.publish(EventType::APP_WIFI_DISCONNECTED);
+    WiFiProfile&          profile = activeProfile();
+    ConnectionInfoPayload connectionInfo{ profile.ssid, IPAddress(0, 0, 0, 0) };
+    _eventBus.publish(EventType::APP_WIFI_DISCONNECTED, &connectionInfo);
 
     if (_intentionalDisconnect) {
         transitionTo(AppWiFiState::STATE_NETWORK_DISABLED);
@@ -586,7 +593,8 @@ void AppConfigManager::handleState_StartCaptivePortal() {
 
 void AppConfigManager::handleState_StartingCaptivePortal() {
     if (millis() - _portalStartMs >= AP_READY_WAIT_MS) {
-        _eventBus.publish(EventType::APP_WIFI_PORTAL_STARTED);
+        ConnectionInfoPayload connectionInfo{ WiFi.softAPSSID().c_str(), WiFi.softAPIP() };
+        _eventBus.publish(EventType::APP_WIFI_PORTAL_STARTED, &connectionInfo);
         transitionTo(AppWiFiState::STATE_PORTAL_ACTIVE);
     }
 }
@@ -616,7 +624,7 @@ void AppConfigManager::handleState_PortalComplete() {
         _portalCompleteMs = millis();   // arm the timer on first entry
         return;
     }
-    if (millis() - _portalCompleteMs < 200) {
+    if (millis() - _portalCompleteMs < 200UL) {
         return;                          // still waiting
     }
     _portalCompleteMs = 0;               // reset for next use
@@ -732,6 +740,7 @@ void AppConfigManager::handleState_StoppingWebPortal() {
     if (_intentionalDisconnect) {
         WiFi.disconnect(true);
         stopMdns();
+
         _eventBus.publish(EventType::APP_WIFI_DISCONNECTED);
         transitionTo(AppWiFiState::STATE_NETWORK_DISABLED);
         return;
@@ -765,7 +774,9 @@ void AppConfigManager::handleState_Reconnecting() {
         transitionTo(AppWiFiState::STATE_CONNECTED);
     } else {
         stopMdns();
-        _eventBus.publish(EventType::APP_WIFI_DISCONNECTED);
+        WiFiProfile&          profile = activeProfile();
+        ConnectionInfoPayload connectionInfo{ profile.ssid, IPAddress(0, 0, 0, 0) };
+        _eventBus.publish(EventType::APP_WIFI_DISCONNECTED, &connectionInfo);
         _retryCount          = 0;
         _activeProfileIndex  = 0;
         _primaryAuthFailed   = false;

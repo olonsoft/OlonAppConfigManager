@@ -149,6 +149,11 @@ struct StateChangePayload {
     AppWiFiState nextState;
 };
 
+struct ConnectionInfoPayload {
+    const char* ssid;
+    IPAddress   ip;
+};
+
 // ============================================================
 //  AppConfigManager
 // ============================================================
@@ -430,8 +435,8 @@ class AppConfigManager {
     // processPendingSave() runs from loop() and does all JSON work there.
     // The pointer is valid until we call req->send(), which we do inside
     // processPendingSave() before clearing the flag.
-    volatile bool              _pendingSaveReady   = false;
-    AsyncWebServerRequestPtr   _pendingSaveRequest; //weak_ptr
+    volatile bool            _pendingSaveReady = false;
+    AsyncWebServerRequestPtr _pendingSaveRequest; //weak_ptr
 
     // Scan state
     bool _scanRunning = false;
